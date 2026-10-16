@@ -8,6 +8,12 @@ Run once:            python nebula_sharepoint.py
 Run every 30 mins:   python nebula_sharepoint.py --watch
 Analyse only:       python nebula_sharepoint.py --dry-run
 Test list login:    python nebula_sharepoint.py --check-sharepoint
+Reset older state:  python nebula_sharepoint.py --reset-state
+
+--reset-state backs up the existing JSON and starts a fresh local baseline.
+It does not delete SharePoint rows. Old breach history and any queued writes
+remain in the backup; they are not automatically imported or replayed.
+Use this option once, not on every scheduled run.
 
 Passwords: ARCGIS_PASSWORD and SHAREPOINT_PASSWORD environment variables,
 or one prompt per password on interactive launch. No password temp files.
@@ -47,6 +53,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -142,6 +149,31 @@ def load_json(filepath):
         with open(filepath, "r", encoding="utf-8") as f:
             return json.load(f)  # A damaged state file must not silently reset alerts.
     return {"version": "nebula-sharepoint-1", "records": {}, "pending": []}
+
+
+def backup_and_reset_state(filepath):
+    """Explicit reset: preserve original bytes before writing a fresh baseline."""
+    path = Path(filepath)
+    backup = None
+    if path.exists():
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        fd, filename = tempfile.mkstemp(
+            dir=path.parent, prefix=f"{path.stem}.backup-{timestamp}-", suffix=".json")
+        backup = Path(filename)
+        try:
+            with os.fdopen(fd, "wb") as output, path.open("rb") as original:
+                shutil.copyfileobj(original, output)
+                output.flush()
+                os.fsync(output.fileno())
+        except Exception:
+            backup.unlink(missing_ok=True)
+            raise
+    # Only reset once the backup has been written successfully.
+    save_json(path, {"version": "nebula-sharepoint-1", "records": {}, "pending": []})
+    if backup:
+        print(f"Previous state backed up to: {backup}")
+    print("Fresh local baseline created. Old history/pending writes are not replayed; SharePoint rows are retained.")
+    return backup
 
 
 def save_json(filepath, data):
@@ -423,8 +455,9 @@ def deliver_pending(state, target, definitions):
 
 def run_once(arcgis_secret, sharepoint_secret, dry_run=False):
     state = load_json(ALERT_STATE_FILE)
-    if state.get("version") != "nebula-sharepoint-1":
-        raise MonitorError("State has a different format. Back it up/rename it before starting this version.")
+    if not isinstance(state, dict) or state.get("version") != "nebula-sharepoint-1":
+        raise MonitorError("An older local state format was found. Run once with --reset-state "
+                           "to back it up and start a fresh baseline; old queued writes stay in the backup")
     tasks, results = [], []
     gis = connect_gis(arcgis_secret)
     for event_type, config in EVENT_LAYERS.items():
@@ -480,7 +513,11 @@ def main():
     modes.add_argument("--watch", action="store_true", help="Repeat every 30 minutes")
     modes.add_argument("--dry-run", action="store_true", help="Query ArcGIS without writing SharePoint")
     modes.add_argument("--check-sharepoint", action="store_true", help="Test list authentication and field names")
+    parser.add_argument("--reset-state", action="store_true",
+                        help="Back up existing state and start a fresh baseline once (old queued writes are not replayed)")
     args = parser.parse_args()
+    if args.reset_state and (args.dry_run or args.check_sharepoint):
+        parser.error("--reset-state cannot be combined with --dry-run or --check-sharepoint")
     try:
         sp_secret = None if args.dry_run else password("SHAREPOINT_PASSWORD", "Microsoft 365 password: ")
         if args.check_sharepoint:
@@ -490,13 +527,15 @@ def main():
         arcgis_secret = password("ARCGIS_PASSWORD", "ArcGIS password: ")
         # Holding this OS-backed lock also protects the pending queue across scans.
         with FileLock(str(ALERT_STATE_FILE) + ".lock", timeout=0):
+            if args.reset_state:
+                backup_and_reset_state(ALERT_STATE_FILE)
             while True:
                 started = time.monotonic()
                 try:
                     run_once(arcgis_secret, sp_secret, args.dry_run)
                 except Exception as exc:
                     status, reason = safe_error(exc)
-                    print(f"{status}: {reason}. Pending writes, if saved, will retry next run.", file=sys.stderr)
+                    print(f"{status}: {reason.rstrip('.')}. Pending writes in the current format retry next run.", file=sys.stderr)
                     if not args.watch:
                         return 1
                 if not args.watch:
