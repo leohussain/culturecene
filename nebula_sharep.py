@@ -1,109 +1,105 @@
-import multiprocessing
-import json
-import os
-import tempfile
-import atexit
-import requests
-from datetime import datetime, date
+    # FIFO. A failed write remains pending and is searched for again before create.
+    while state["pending"]:
+        write_sharepoint(target, definitions, state["pending"][0])
+        state["pending"].pop(0)
+        save_json(ALERT_STATE_FILE, state)
 
-import urllib3
-import warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
-# =============================================================================
-# PASSWORD HANDLING
-# =============================================================================
+def run_once(arcgis_secret, sharepoint_secret, dry_run=False):
+    state = load_json(ALERT_STATE_FILE)
+    if state.get("version") != "nebula-sharepoint-1":
+        raise MonitorError("State has a different format. Back it up/rename it before starting this version.")
+    tasks, results = [], []
+    gis = connect_gis(arcgis_secret)
+    for event_type, config in EVENT_LAYERS.items():
+        try:
+            events = fetch_events(event_type, config, gis)
+            source_error = None
+        except Exception as exc:
+            events = {}
+            status, reason = safe_error(exc)
+            source_error = {"Status": status, "AlertReason": reason, "Count": None}
+        for region in PORTFOLIO_LAYERS:
+            for event in events.values():
+                tasks.append({"Title": event_type, "Region": region, **event})
+            old = [r for r in state["records"].values()
+                   if r["fields"]["Title"] == event_type and r["fields"]["Region"] == region]
+            for record in old:
+                fields = record["fields"]
+                if fields["EventID"] not in events and fields["EventID"] != "__SOURCE__":
+                    results.append((fields, source_error or {"Count": None, "Status": "ERROR",
+                        "AlertReason": "Event no longer appears in the feed; resolution is unconfirmed"}))
+            source_key = key_for(event_type, "__SOURCE__", region)
+            if source_error or not events or source_key in state["records"]:
+                health = source_error or {"Count": 0, "AffectedLocations": "", "fingerprint": "source-ok"}
+                task = {"Title": event_type, "EventID": "__SOURCE__",
+                        "EventName": "[Source check]", "Region": region}
+                results.append((task, health))
+    results.extend(run_parallel(tasks, arcgis_secret))
+    records = []
+    for task, outcome in results:
+        key = key_for(task["Title"], task["EventID"], task["Region"])
+        record = make_record(task, outcome, state["records"].get(key, {}))
+        if task["EventID"] == "__SOURCE__" and not outcome.get("Status"):
+            record["fields"]["AlertReason"] = "Event feed query succeeded. Source check only, not exposure clearance."
+        records.append(record)
+        if not dry_run:
+            state["records"][key] = record
+            state["pending"].append(record["fields"].copy())
+        f = record["fields"]
+        print(f"{f['Title']} | {f['Region']} | {f['Status']} | Count={f['Count']}")
+    save_json(RESULTS_FILE, {"checked_at": now(), "results": [r["fields"] for r in records]})
+    if dry_run:
+        print(f"Dry run saved to {RESULTS_FILE}; no list or state changes.")
+        return
+    save_json(ALERT_STATE_FILE, state)  # Save results before attempting SharePoint.
+    target, definitions = connect_sharepoint(sharepoint_secret)
+    deliver_pending(state, target, definitions)
+    print(f"SharePoint updated: {SHAREPOINT_LIST_NAME} ({len(records)} results this scan).")
 
-_env_password = os.environ.get("ARCGIS_PASSWORD")
-if _env_password:
-    PASSWORD = 'n0h47Rd6AWA0obOCNgvI!'
-else:
-    import getpass
-    PASSWORD = getpass.getpass("Enter ArcGIS password (once only): ")
 
-_PASS_FILE = os.path.join(tempfile.gettempdir(), "nebula_arcgis.tmp")
-
-with open(_PASS_FILE, "w") as _f:
-    _f.write(PASSWORD)
-
-def _cleanup_pass_file():
+def main():
+    parser = argparse.ArgumentParser(description="ArcGIS intersections to Nebula Alerts")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--watch", action="store_true", help="Repeat every 30 minutes")
+    modes.add_argument("--dry-run", action="store_true", help="Query ArcGIS without writing SharePoint")
+    modes.add_argument("--check-sharepoint", action="store_true", help="Test list authentication and field names")
+    args = parser.parse_args()
     try:
-        if os.path.exists(_PASS_FILE):
-            os.remove(_PASS_FILE)
-    except Exception:
-        pass
+        sp_secret = None if args.dry_run else password("SHAREPOINT_PASSWORD", "Microsoft 365 password: ")
+        if args.check_sharepoint:
+            connect_sharepoint(sp_secret)
+            print("SharePoint login/list/fields OK. No items written.")
+            return 0
+        arcgis_secret = password("ARCGIS_PASSWORD", "ArcGIS password: ")
+        # Holding this OS-backed lock also protects the pending queue across scans.
+        with FileLock(str(ALERT_STATE_FILE) + ".lock", timeout=0):
+            while True:
+                started = time.monotonic()
+                try:
+                    run_once(arcgis_secret, sp_secret, args.dry_run)
+                except Exception as exc:
+                    status, reason = safe_error(exc)
+                    print(f"{status}: {reason}. Pending writes, if saved, will retry next run.", file=sys.stderr)
+                    if not args.watch:
+                        return 1
+                if not args.watch:
+                    return 0
+                delay = max(1, CHECK_INTERVAL_SECONDS - (time.monotonic() - started))
+                print(f"Next check in {int(delay)} seconds; Ctrl+C stops the monitor.")
+                time.sleep(delay)
+    except LockTimeout:
+        print("Another instance is using this state file; exiting.", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("Monitor stopped.")
+        return 0
+    except Exception as exc:
+        _, reason = safe_error(exc)
+        print(reason, file=sys.stderr)
+        return 1
 
-atexit.register(_cleanup_pass_file)
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-PORTAL_URL = "https://axaxl-gis.cloud.esriuk.com/portal"
-USERNAME   = "builtin.admin"
-
-PORTFOLIO_LAYERS = {
-    "Florida WS": {
-        "url":        "https://axaxl-gis.cloud.esriuk.com/server/rest/services/Hosted/Florida_Aug26_Peril2/FeatureServer/0",
-        "name_field": "AccountName",
-        "id_field":   "Locid"
-    },
-    # "Australia WF": {
-    #     "url":        "https://axaxl-gis.cloud.esriuk.com/server/rest/services/Hosted/Australia_Aug26_Peril5/FeatureServer/0",
-    #     "name_field": "AccountName",
-    #     "id_field":   "Locid"
-    # },
-    # "Philippines WS": {
-    #     "url":        "https://axaxl-gis.cloud.esriuk.com/server/rest/services/Hosted/Philippines_May26_Peril2/FeatureServer/0",
-    #     "name_field": "AccountName",
-    #     "id_field":   "Locid"
-    # },
-}
-
-EVENT_LAYERS = {
-    # "Wildfire Perimeters": {
-    #     "url":        "https://axaxl-gis.cloud.esriuk.com/server/rest/services/Hosted/Wildfire_Perimeters/FeatureServer/0",
-    #     "name_field": "IncidentName",
-    #     "id_field":   "GeometryID"
-    # },
-    "Hurricane Tracks": {
-        "url":        "https://services9.arcgis.com/RHVPKKiFTONKtxq3/ArcGIS/rest/services/Recent_Hurricanes_v1/FeatureServer/2",
-        "name_field": "StormName",
-        "id_field":   "StormID"
-    },
-    "Flood Events": {
-        "url":        "https://axaxl-gis.cloud.esriuk.com/server/rest/services/Hosted/ICEYE_Texas_Flood_July_26_Extent/FeatureServer/0",
-        "name_field": "flooded_cities",
-        "id_field":   "flood_id"
-    },
-}
-
-GLOBAL_THRESHOLD        = 1
-REGION_THRESHOLDS       = {
-    "Florida WS": 1,
-}
-
-ALERT_MODE              = "BOTH"
-DIGEST_HOUR             = 7
-MAX_PARALLEL_WORKERS    = 8
-SUSPECT_COUNT_THRESHOLD = 15000
-
-# --- SharePoint Configuration ---
-SHAREPOINT_SITE_URL     = "https://xlgroupcrmeur.sharepoint.com/:l:/r/teams/GIS90/Lists/Nebula%20Alerts?e=WLRnxL"
-SHAREPOINT_LIST_NAME    = "Nebula Alerts"
-SHAREPOINT_USERNAME     = "leo.hussain@axaxl.com"
-SHAREPOINT_PASSWORD     = 'Khaleesi12;;'#os.environ.get("SHAREPOINT_PASSWORD", "")
-
-# --- State Files ---
-ALERT_STATE_FILE        = "nebula_alert_state.json"
-DIGEST_STATE_FILE       = "nebula_digest_state.json"
-
-# =============================================================================
-# STATE MANAGEMENT
-# =============================================================================
-
-def load_json(filepath):
-    if os.path.exists(filepath):
-        with open(filepath, "r") as f:
-            return 
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    raise SystemExit(main())
