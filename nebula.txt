@@ -1,0 +1,59 @@
+Project Summary for ChatGPT
+I am building a Python script that monitors portfolio risk from live catastrophe events using ArcGIS Enterprise. Here is what the script needs to do:
+
+What the Script Does
+The script connects to an ArcGIS Enterprise portal and performs spatial intersection analysis between live event polygon layers and static portfolio point layers. It runs on a schedule every 30 minutes.
+
+ArcGIS Connection:
+
+Portal URL: https://axaxl-gis.cloud.esriuk.com/portal
+Username: builtin.admin
+Uses verify_cert=False due to internal SSL certificate
+Event Layers (polygon layers that change in near real time):
+
+Hurricane Tracks from ArcGIS Online
+Flood Event polygons hosted on ArcGIS Enterprise
+Portfolio Layers (static point layers of insured locations):
+
+Florida Wind Storm portfolio
+Australia Wildfire portfolio (commented out for now)
+Philippines Wind Storm portfolio (commented out for now)
+Spatial Analysis:
+
+For every event polygon, query how many portfolio points fall inside it
+This runs using multiprocessing.Pool with 8 parallel workers for speed
+Each worker spawns its own GIS connection using a password read from a temp file to avoid repeated password prompts
+Results are categorised as BREACH, CLEAN, ALL CLEAR, SUSPECT, ERROR or TIMEOUT
+BREACH = location count meets or exceeds threshold
+SUSPECT = count exceeds a sanity check threshold suggesting a possible false intersection
+ALL CLEAR = was previously a breach but no longer is
+A state JSON file tracks previous run results to detect new breaches, count changes and resolved events
+Alert Thresholds:
+
+Global threshold is 1 — any intersection triggers an alert
+Per region thresholds can be set individually
+What I Want to Do With the Results — SharePoint Integration
+Instead of sending emails (SMTP is blocked/hanging in our corporate network) or Teams webhooks (blocked by admin data policy), I want to write the results to a SharePoint list.
+
+SharePoint details:
+
+Site URL: https://xlgroupcrmeur.sharepoint.com/teams/GIS90
+List name: Nebula Alerts
+Authentication: Username and password using the Office365-REST-Python-Client Python library
+Username: Microsoft 365 account email
+Password: Microsoft 365 account password
+The SharePoint list has these columns:
+
+Title — Event Type (e.g. Hurricane Tracks)
+EventName — Name of the specific event
+EventID — Unique ID of the event
+Region — Portfolio region name (e.g. Florida WS)
+Count — Number of portfolio locations intersecting the event
+Threshold — The alert threshold for that region
+Status — Choice field: BREACH, ALL CLEAR, CLEAN, SUSPECT, ERROR, TIMEOUT
+AlertReason — Text description of why the alert was raised
+AffectedLocations — Comma separated list of affected location names
+Timestamp — Date and time of the check
+SharePoint writing logic:
+
+Connect to SharePoint using
